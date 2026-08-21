@@ -1,0 +1,34 @@
+{
+  "name": "top-island",
+  "version": "0.1.0",
+  "description": "Windows 顶部灵动岛：半藏/全藏、通知弹出、播放歌词",
+  "main": "out/main/index.js",
+  "license": "MIT",
+  "author": "top-island",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "start": "electron-vite preview",
+    "pack": "npm run build && electron-builder --win --dir",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2",
+    "motion": "^12.43.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.5.2",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
