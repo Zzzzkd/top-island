@@ -4,13 +4,14 @@ import { readFileSync, writeFileSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { AiProvider, IslandChatMessage, IslandMode, IslandState, LyricLine, MediaTrack, NotificationEvent } from "../shared/types"
+import type { AiProvider, IslandChatMessage, IslandMode, IslandState, LyricLine, LyricWindow, MediaTrack, NotificationEvent } from "../shared/types"
 import { listCursorChats, peekCursorWindow, readCursorReply, selectCursorChat } from "./ai/cursorWindow"
 import { sendToLocalApp } from "./ai/localApps"
-import { CANVAS, IPC, hideTarget, hoverHitRect } from "../shared/types"
+import { IPC, hideTarget, hoverHitRect } from "../shared/types"
 import type { MediaSource } from "./sources/media"
 import type { NotificationSource } from "./sources/notifications"
 import type { LyricSource } from "./sources/lyrics"
+import { sendMediaCommand } from "./mediaControl"
 
 interface Sources {
   notify: NotificationSource
@@ -22,21 +23,34 @@ const NOTIFY_HOLD_MS = 5200
 const HOVER_COLLAPSE_MS = 220
 const CURSOR_MS = 32
 
+function emptyLyricWindow(): LyricWindow {
+  return { previous: null, current: null, next: null, index: -1 }
+}
+
 export class IslandController {
   private mode: IslandMode = "peek"
   private hide = 1
   private userPinned: IslandMode | null = "peek"
   private notification: NotificationEvent | null = null
   private track: MediaTrack | null = null
+  private trackKey = ""
+  private trackOrigin = 0
+  private trackBasePos = 0
+  private heldStatus: { key: string; status: "playing" | "paused"; until: number } | null = null
   private lyric = ""
+  private lyricIndex = -1
   private lines: LyricLine[] = []
+  private lyricsTranslationEnabled = true
   private notifyTimer: NodeJS.Timeout | null = null
   private lyricTimer: NodeJS.Timeout | null = null
+  private lyricFetchKey = ""
+  private lastLyricPositionBucket = -1
   private hoverExpanded = false
   private large = false
   private hoverLeaveTimer: NodeJS.Timeout | null = null
   private cursorTimer: NodeJS.Timeout | null = null
   private lastOverPill = false
+  private floatingLyricsEnabled = true
   private aiProvider: AiProvider = "cursor"
   private aiPrompt = ""
   private aiReply = "发给当前打开的 Cursor 窗口，回复同步回岛上。"
@@ -55,6 +69,7 @@ export class IslandController {
   ) {}
 
   start(): void {
+    this.loadSettings()
     this.sources.notify.onNotification((event) => this.showNotification(event))
     this.sources.notify.onAccess?.((access) => {
       if (access !== "Allowed") {
@@ -72,6 +87,7 @@ export class IslandController {
     this.sources.notify.start()
     this.sources.media.start()
     this.placeCanvas()
+    screen.on("display-metrics-changed", () => this.placeCanvas())
     this.win.setIgnoreMouseEvents(true, { forward: true })
     this.cursorTimer = setInterval(() => this.syncCursor(), CURSOR_MS)
     this.syncTimer = setInterval(() => void this.syncCursorChat(), 2200)
@@ -88,6 +104,11 @@ export class IslandController {
       notification: this.notification,
       track: this.track,
       lyric: this.lyric,
+      lyricWindow: this.buildLyricWindow(),
+      settings: {
+        floatingLyricsEnabled: this.floatingLyricsEnabled,
+        lyricsTranslationEnabled: this.lyricsTranslationEnabled
+      },
       ai: {
         provider: this.aiProvider,
         prompt: this.aiPrompt,
@@ -102,6 +123,26 @@ export class IslandController {
 
   setAiProvider(provider: AiProvider): void {
     this.aiProvider = provider
+    this.pushState()
+  }
+
+  setLyricsTranslationEnabled(enabled: boolean): void {
+    if (this.lyricsTranslationEnabled === enabled) return
+    this.lyricsTranslationEnabled = enabled
+    this.saveSettings()
+    this.pushState()
+  }
+
+  setFloatingLyricsEnabled(enabled: boolean): void {
+    if (this.floatingLyricsEnabled === enabled) return
+    this.floatingLyricsEnabled = enabled
+    this.saveSettings()
+    if (!this.large && !this.notification) {
+      if (enabled && this.track?.status === "playing") this.presentNowPlaying()
+      else if (!enabled && this.mode === "lyrics") this.restoreIdle()
+      else this.pushState()
+      return
+    }
     this.pushState()
   }
 
@@ -241,6 +282,7 @@ export class IslandController {
     this.clearHoverLeave()
     this.userPinned = mode === "notify" || mode === "lyrics" ? null : mode
     this.setMode(mode)
+    this.syncCursor(true)
   }
 
   toggleLarge(): void {
@@ -251,10 +293,13 @@ export class IslandController {
         this.mode = "compact"
       }
     } else {
-      this.hide = hideTarget(this.mode)
+      this.restoreIdle()
+      this.syncCursor(true)
+      return
     }
     this.placeCanvas()
     this.pushState()
+    this.syncCursor(true)
   }
 
   collapseOutside(): void {
@@ -262,8 +307,8 @@ export class IslandController {
     this.large = false
     this.hoverExpanded = false
     this.clearHoverLeave()
-    this.setMode(this.userPinned === "hidden" ? "hidden" : "peek")
-    this.placeCanvas()
+    this.restoreIdle()
+    this.syncCursor(true)
   }
 
   setHover(hovering: boolean): void {
@@ -317,8 +362,9 @@ export class IslandController {
       { timeMs: 10800, text: "随记忆一直晃到现在" }
     ]
     this.lyric = this.lines[0].text
-    this.setMode("lyrics")
+    this.lyricIndex = 0
     this.startLyricClock()
+    this.presentNowPlaying()
   }
 
   private showNotification(event: NotificationEvent): void {
@@ -328,6 +374,7 @@ export class IslandController {
     this.hide = 0
     this.placeCanvas()
     this.pushState()
+    this.syncCursor(true)
     if (this.notifyTimer) clearTimeout(this.notifyTimer)
     this.notifyTimer = setTimeout(() => {
       this.notification = null
@@ -335,52 +382,208 @@ export class IslandController {
     }, NOTIFY_HOLD_MS)
   }
 
-  private onTrack(track: MediaTrack | null): void {
-    this.track = track
-    if (!track || track.status !== "playing") {
-      if (this.mode === "lyrics") this.restoreIdle()
+  async controlMedia(command: "playpause" | "next" | "prev"): Promise<void> {
+    const commandTrack = this.track
+    if (command === "playpause" && commandTrack) {
+      const previousStatus = commandTrack.status
+      const status = previousStatus === "playing" ? "paused" : "playing"
+      const position = this.currentPosition()
+      this.heldStatus = {
+        key: `${commandTrack.artist}|${commandTrack.title}`,
+        status,
+        until: Date.now() + 1800
+      }
+      this.track = { ...commandTrack, status, positionMs: position }
+      this.trackBasePos = position
+      this.trackOrigin = Date.now()
+      this.pushState()
+      if (status === "playing") this.presentNowPlaying()
+      else if (this.mode === "lyrics") this.restoreIdle()
+
+      const result = await sendMediaCommand(command, commandTrack)
+      if (!result.ok && this.trackKey === `${commandTrack.artist}|${commandTrack.title}` && this.track) {
+        this.heldStatus = null
+        this.track = { ...this.track, status: previousStatus, positionMs: position }
+        this.trackBasePos = position
+        this.trackOrigin = Date.now()
+        this.pushState()
+      }
       return
     }
-    if (this.mode === "notify") return
-    void this.sources.lyrics.fetch(track).then((payload) => {
+
+    if (command === "next" || command === "prev") {
+      this.heldStatus = null
+    }
+    await sendMediaCommand(command, commandTrack)
+  }
+
+  private onTrack(track: MediaTrack | null): void {
+    const nextKey = track ? `${track.artist}|${track.title}` : ""
+    const prevStatus = this.track?.status
+    const now = Date.now()
+    if (this.heldStatus && (now >= this.heldStatus.until || (nextKey && nextKey !== this.heldStatus.key))) {
+      this.heldStatus = null
+    }
+    const sameSong = nextKey !== "" && nextKey === this.trackKey
+    const songChanged = nextKey !== this.trackKey
+
+    // 播放器的后续进度事件经常不再携带封面，保留当前歌曲已经补全的媒体信息。
+    if (track && sameSong && this.track) {
+      track = {
+        ...track,
+        durationMs: track.durationMs || this.track.durationMs,
+        artwork: track.artwork || this.track.artwork,
+        album: track.album || this.track.album,
+        positionSource: track.positionSource || this.track.positionSource
+      }
+    }
+
+    if (track && this.heldStatus && nextKey === this.heldStatus.key) {
+      if (track.status === this.heldStatus.status) {
+        // 播放器已确认刚才的播放/暂停操作，立即恢复以真实状态为准。
+        this.heldStatus = null
+      } else {
+        track = { ...track, status: this.heldStatus.status }
+      }
+    }
+
+    if (
+      track &&
+      sameSong &&
+      track.positionSource === "estimated" &&
+      (track.positionMs || 0) === 0 &&
+      this.track &&
+      this.track.positionMs > 1500
+    ) {
+      track = { ...track, positionMs: this.track.positionMs }
+    }
+
+    this.track = track
+    this.trackBasePos = track?.positionMs ?? 0
+    this.trackOrigin = now
+
+    if (!this.track) {
+      this.trackKey = ""
+      this.lyricFetchKey = ""
+      this.lines = []
+      this.lyric = ""
+      this.lyricIndex = -1
+      this.lastLyricPositionBucket = -1
+      this.pushState()
+      this.restoreIdle()
+      return
+    }
+
+    this.trackKey = nextKey
+    if (songChanged) {
+      this.lines = []
+      this.lyric = `${this.track.artist} · ${this.track.title}`
+      this.lyricIndex = -1
+      this.lyricFetchKey = ""
+      this.lastLyricPositionBucket = -1
+    }
+    this.pushState()
+
+    if (this.track.status !== "playing") {
+      if (this.mode === "lyrics") this.restoreIdle()
+      this.fetchTrackExtras(nextKey)
+      return
+    }
+
+    const started = prevStatus !== "playing"
+    this.startLyricClock()
+    if (songChanged || started) this.presentNowPlaying()
+    this.fetchTrackExtras(nextKey)
+  }
+
+  private fetchTrackExtras(nextKey: string): void {
+    if (this.lyricFetchKey === nextKey) return
+    this.lyricFetchKey = nextKey
+    const lyricTrack = this.track
+    if (!lyricTrack) return
+    void this.sources.lyrics.fetch(lyricTrack).then((payload) => {
+      if (this.trackKey !== nextKey || this.lyricFetchKey !== nextKey) return
       this.lines = payload?.lines ?? []
-      this.lyric = this.pickLyric(track.positionMs)
-      this.setMode("lyrics")
-      this.startLyricClock()
+      if (this.track && payload) {
+        this.track = {
+          ...this.track,
+          durationMs: this.track.durationMs || payload.durationMs || 0,
+          artwork: this.track.artwork || payload.artwork,
+          album: this.track.album || payload.album
+        }
+      }
+      this.lyric = this.pickLyric(this.currentPosition())
+      this.pushState()
     })
   }
 
+  private currentPosition(): number {
+    if (!this.track) return 0
+    if (this.track.status !== "playing") return this.track.positionMs
+    const pos = this.trackBasePos + (Date.now() - this.trackOrigin)
+    const duration = this.track.durationMs || 0
+    return duration > 0 ? Math.min(pos, duration) : pos
+  }
+
   private startLyricClock(): void {
-    if (this.lyricTimer) clearInterval(this.lyricTimer)
-    const started = Date.now()
-    const base = this.track?.positionMs ?? 0
+    if (this.lyricTimer) return
     this.lyricTimer = setInterval(() => {
       if (!this.track || this.track.status !== "playing") return
-      const pos = base + (Date.now() - started)
+      const pos = this.currentPosition()
       this.track = { ...this.track, positionMs: pos }
       const next = this.pickLyric(pos)
-      if (next !== this.lyric) {
-        this.lyric = next
-        this.pushState()
-      }
+      const lyricChanged = next !== this.lyric
+      const positionBucket = Math.floor(pos / 500)
+      const positionChanged = positionBucket !== this.lastLyricPositionBucket
+      this.lyric = next
+      this.lastLyricPositionBucket = positionBucket
+      if (lyricChanged || positionChanged) this.pushState()
     }, 200)
   }
 
   private pickLyric(positionMs: number): string {
     let text = this.track ? `${this.track.artist} · ${this.track.title}` : ""
-    for (const line of this.lines) {
-      if (line.timeMs <= positionMs) text = line.text
+    let index = -1
+    for (let i = 0; i < this.lines.length; i += 1) {
+      if (this.lines[i].timeMs > positionMs) break
+      index = i
+      text = this.lines[i].text
     }
+    this.lyricIndex = index
     return text
   }
 
+  private buildLyricWindow(): LyricWindow {
+    const index = this.lyricIndex
+    if (index < 0) {
+      return {
+        ...emptyLyricWindow(),
+        current: this.lyric ? { timeMs: 0, text: this.lyric } : null
+      }
+    }
+    return {
+      previous: index > 0 ? this.lines[index - 1] : null,
+      current: this.lines[index] || null,
+      next: this.lines[index + 1] || null,
+      index
+    }
+  }
+
   private restoreIdle(): void {
-    const fallback = this.userPinned ?? (this.track?.status === "playing" ? "lyrics" : "peek")
-    if (fallback === "lyrics" && this.track?.status === "playing") {
+    if (this.large) return
+    if (this.floatingLyricsEnabled && this.track?.status === "playing") {
+      this.hoverExpanded = false
       this.setMode("lyrics")
       return
     }
-    this.setMode(fallback === "lyrics" ? "peek" : fallback)
+    const fallback = this.userPinned ?? "peek"
+    this.setMode(fallback === "notify" || fallback === "lyrics" ? "peek" : fallback)
+  }
+
+  private presentNowPlaying(): void {
+    if (!this.floatingLyricsEnabled || this.large || this.notification) return
+    this.hoverExpanded = false
+    this.setMode("lyrics")
   }
 
   private setMode(mode: IslandMode): void {
@@ -391,17 +594,14 @@ export class IslandController {
   }
 
   private placeCanvas(): void {
-    const display = screen.getPrimaryDisplay()
-    const area = display.bounds
-    if (this.large) {
-      this.win.setBounds({ x: area.x, y: area.y, width: area.width, height: area.height })
-      return
-    }
-    const x = Math.round(area.x + (area.width - CANVAS.width) / 2)
-    this.win.setBounds({ x, y: area.y, width: CANVAS.width, height: CANVAS.height })
+    const area = screen.getPrimaryDisplay().bounds
+    const next = { x: area.x, y: area.y, width: area.width, height: area.height }
+    const cur = this.win.getBounds()
+    if (cur.x === next.x && cur.y === next.y && cur.width === next.width && cur.height === next.height) return
+    this.win.setBounds(next)
   }
 
-  private syncCursor(): void {
+  private syncCursor(force = false): void {
     if (this.win.isDestroyed()) return
     if (this.large) {
       if (this.lastOverPill) this.lastOverPill = false
@@ -409,7 +609,11 @@ export class IslandController {
       return
     }
     const over = this.pointOverPill()
-    if (over === this.lastOverPill) return
+    // Closing the large panel changes the native window from fully interactive
+    // back to click-through. Force the update even when the cached hover value
+    // is already false, otherwise the fullscreen transparent window keeps
+    // swallowing clicks outside the island.
+    if (!force && over === this.lastOverPill) return
     this.lastOverPill = over
     this.win.setIgnoreMouseEvents(!over, { forward: true })
     this.setHover(over)
@@ -418,7 +622,7 @@ export class IslandController {
   private pointOverPill(): boolean {
     const point = screen.getCursorScreenPoint()
     const bounds = this.win.getBounds()
-    const hit = hoverHitRect(this.mode, this.hide, this.large)
+    const hit = hoverHitRect(this.mode, this.hide, this.large, bounds.width, Boolean(this.track?.title))
     const x = point.x - bounds.x
     const y = point.y - bounds.y
     return x >= hit.x && x <= hit.x + hit.width && y >= hit.y && y <= hit.y + hit.height
@@ -457,6 +661,41 @@ export class IslandController {
       }
     }
     this.appendMessage({ role: "assistant", text })
+  }
+
+  private settingsFile(): string {
+    return join(app.getPath("userData"), "island-settings.json")
+  }
+
+  private loadSettings(): void {
+    try {
+      const raw = JSON.parse(readFileSync(this.settingsFile(), "utf8")) as {
+        floatingLyricsEnabled?: boolean
+        lyricsTranslationEnabled?: boolean
+      }
+      if (typeof raw.floatingLyricsEnabled === "boolean") {
+        this.floatingLyricsEnabled = raw.floatingLyricsEnabled
+      }
+      if (typeof raw.lyricsTranslationEnabled === "boolean") {
+        this.lyricsTranslationEnabled = raw.lyricsTranslationEnabled
+      }
+    } catch {
+      // first run
+    }
+  }
+
+  private saveSettings(): void {
+    try {
+      writeFileSync(
+        this.settingsFile(),
+        JSON.stringify({
+          floatingLyricsEnabled: this.floatingLyricsEnabled,
+          lyricsTranslationEnabled: this.lyricsTranslationEnabled
+        })
+      )
+    } catch {
+      // ignore disk errors
+    }
   }
 
   private chatFile(): string {

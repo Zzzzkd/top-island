@@ -2,6 +2,8 @@ appId: com.topisland.app
 productName: Top Island
 directories:
   output: release
+asarUnpack:
+  - node_modules/loudness/impl/windows/*.exe
 files:
   - out/**/*
   - package.json
