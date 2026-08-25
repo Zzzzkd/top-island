@@ -14,19 +14,33 @@ export interface MediaTrack {
   artist: string
   album?: string
   appName?: string
+  artwork?: string
   status: "playing" | "paused" | "stopped"
   positionMs: number
   durationMs: number
+  positionSource?: "smtc" | "netease" | "estimated"
+  seekable?: boolean
 }
 
 export interface LyricLine {
   timeMs: number
   text: string
+  translation?: string
+}
+
+export interface LyricWindow {
+  previous: LyricLine | null
+  current: LyricLine | null
+  next: LyricLine | null
+  index: number
 }
 
 export interface LyricPayload {
   trackKey: string
   lines: LyricLine[]
+  durationMs?: number
+  artwork?: string
+  album?: string
 }
 
 export type AiProvider = "cursor" | "codex"
@@ -46,6 +60,17 @@ export interface AiState {
   chats: string[]
 }
 
+export interface SystemVolumeState {
+  level: number
+  muted: boolean
+  available: boolean
+}
+
+export interface IslandSettings {
+  floatingLyricsEnabled: boolean
+  lyricsTranslationEnabled: boolean
+}
+
 export interface IslandState {
   mode: IslandMode
   hide: number
@@ -53,6 +78,8 @@ export interface IslandState {
   notification: NotificationEvent | null
   track: MediaTrack | null
   lyric: string
+  lyricWindow: LyricWindow
+  settings: IslandSettings
   ai: AiState
 }
 
@@ -71,10 +98,18 @@ export const IPC = {
   saveTempImage: "island:save-temp-image",
   previewImage: "island:preview-image",
   setAiProvider: "island:set-ai-provider",
-  selectChat: "island:select-chat"
+  setFloatingLyricsEnabled: "island:set-floating-lyrics-enabled",
+  setLyricsTranslationEnabled: "island:set-lyrics-translation-enabled",
+  selectChat: "island:select-chat",
+  getSystemVolume: "island:get-system-volume",
+  setSystemVolume: "island:set-system-volume",
+  setSystemMuted: "island:set-system-muted",
+  mediaPlayPause: "island:media-play-pause",
+  mediaNext: "island:media-next",
+  mediaPrev: "island:media-prev"
 } as const
 
-/** 对齐 WinIsland：固定画布，岛在内部滑动，不靠改窗口大小做半隐藏。 */
+/** 岛在窗口里水平居中；窗口本身铺满主屏，避免点开时改窗口尺寸导致左上角闪一下。 */
 export const CANVAS = { width: 520, height: 300 }
 export const TOP_OFFSET = 8
 export const HIDDEN_SLIVER = 7
@@ -85,11 +120,13 @@ export const PILL_SIZE: Record<IslandMode, { width: number; height: number }> = 
   peek: { width: 120, height: 28 },
   compact: { width: 120, height: 28 },
   notify: { width: 360, height: 72 },
-  lyrics: { width: 420, height: 52 }
+  lyrics: { width: 360, height: 52 }
 }
 
-export function currentPillSize(mode: IslandMode, large: boolean): { width: number; height: number } {
-  return large ? PANEL_SIZE : PILL_SIZE[mode]
+export function currentPillSize(mode: IslandMode, large: boolean, hasTrack = false): { width: number; height: number } {
+  if (large) return PANEL_SIZE
+  if (hasTrack && mode === "compact") return { width: 248, height: 28 }
+  return PILL_SIZE[mode]
 }
 
 export function isExpandedMode(mode: IslandMode): boolean {
@@ -112,12 +149,14 @@ export function pillSlideY(mode: IslandMode, hide: number, large = false): numbe
 export function pillHitRect(
   mode: IslandMode,
   hide: number,
-  large = false
+  large = false,
+  canvasWidth = CANVAS.width,
+  hasTrack = false
 ): { x: number; y: number; width: number; height: number } {
-  const size = currentPillSize(mode, large)
+  const size = currentPillSize(mode, large, hasTrack)
   const y = TOP_OFFSET + pillSlideY(mode, hide, large)
   return {
-    x: (CANVAS.width - size.width) / 2,
+    x: (canvasWidth - size.width) / 2,
     y,
     width: size.width,
     height: size.height
@@ -128,9 +167,11 @@ export function pillHitRect(
 export function hoverHitRect(
   mode: IslandMode,
   hide: number,
-  large = false
+  large = false,
+  canvasWidth = CANVAS.width,
+  hasTrack = false
 ): { x: number; y: number; width: number; height: number } {
-  const pill = pillHitRect(mode, hide, large)
+  const pill = pillHitRect(mode, hide, large, canvasWidth, hasTrack)
   const top = hide > 0.5 ? Math.max(0, pill.y) : 0
   const bottom = pill.y + pill.height
   return {

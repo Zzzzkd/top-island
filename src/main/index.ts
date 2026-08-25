@@ -5,8 +5,9 @@ import { DemoNotificationSource, WindowsNotificationSource } from "./sources/not
 import { DemoMediaSource, WindowsSmtcSource } from "./sources/media"
 import { CompositeLyricSource } from "./sources/lyrics"
 import type { AiProvider, IslandMode } from "../shared/types"
-import { CANVAS, IPC } from "../shared/types"
+import { IPC } from "../shared/types"
 import { killOtherTopIslandProcesses } from "./singleton"
+import { getSystemVolume, setSystemMuted, setSystemVolume } from "./systemVolume"
 
 killOtherTopIslandProcesses()
 const gotLock = app.requestSingleInstanceLock()
@@ -21,9 +22,9 @@ function createWindow(): BrowserWindow {
   const display = screen.getPrimaryDisplay()
   const area = display.bounds
   const win = new BrowserWindow({
-    width: CANVAS.width,
-    height: CANVAS.height,
-    x: Math.round(area.x + (area.width - CANVAS.width) / 2),
+    width: area.width,
+    height: area.height,
+    x: area.x,
     y: area.y,
     frame: false,
     transparent: true,
@@ -77,7 +78,19 @@ function bindIpc(island: IslandController): void {
   ipcMain.handle(IPC.setAiProvider, (_event, provider: AiProvider) => {
     island.setAiProvider(provider)
   })
+  ipcMain.handle(IPC.setFloatingLyricsEnabled, (_event, enabled: boolean) => {
+    island.setFloatingLyricsEnabled(enabled)
+  })
+  ipcMain.handle(IPC.setLyricsTranslationEnabled, (_event, enabled: boolean) => {
+    island.setLyricsTranslationEnabled(enabled)
+  })
   ipcMain.handle(IPC.selectChat, (_event, title: string) => island.selectChat(title))
+  ipcMain.handle(IPC.getSystemVolume, () => getSystemVolume())
+  ipcMain.handle(IPC.setSystemVolume, (_event, level: number) => setSystemVolume(level))
+  ipcMain.handle(IPC.setSystemMuted, (_event, muted: boolean) => setSystemMuted(muted))
+  ipcMain.handle(IPC.mediaPlayPause, () => island.controlMedia("playpause"))
+  ipcMain.handle(IPC.mediaNext, () => island.controlMedia("next"))
+  ipcMain.handle(IPC.mediaPrev, () => island.controlMedia("prev"))
 }
 
 function loadTrayIcon(): Electron.NativeImage {

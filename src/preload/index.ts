@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron"
-import type { AiProvider, IslandMode, IslandState } from "../shared/types"
+import type { AiProvider, IslandMode, IslandState, SystemVolumeState } from "../shared/types"
 import { IPC } from "../shared/types"
 
 contextBridge.exposeInMainWorld("island", {
@@ -17,7 +17,17 @@ contextBridge.exposeInMainWorld("island", {
     ipcRenderer.invoke(IPC.saveTempImage, payload),
   previewImage: (path: string): Promise<string> => ipcRenderer.invoke(IPC.previewImage, path),
   setAiProvider: (provider: AiProvider): Promise<void> => ipcRenderer.invoke(IPC.setAiProvider, provider),
+  setFloatingLyricsEnabled: (enabled: boolean): Promise<void> =>
+    ipcRenderer.invoke(IPC.setFloatingLyricsEnabled, enabled),
+  setLyricsTranslationEnabled: (enabled: boolean): Promise<void> =>
+    ipcRenderer.invoke(IPC.setLyricsTranslationEnabled, enabled),
   selectChat: (title: string): Promise<void> => ipcRenderer.invoke(IPC.selectChat, title),
+  getSystemVolume: (): Promise<SystemVolumeState> => ipcRenderer.invoke(IPC.getSystemVolume),
+  setSystemVolume: (level: number): Promise<void> => ipcRenderer.invoke(IPC.setSystemVolume, level),
+  setSystemMuted: (muted: boolean): Promise<void> => ipcRenderer.invoke(IPC.setSystemMuted, muted),
+  mediaPlayPause: (): Promise<void> => ipcRenderer.invoke(IPC.mediaPlayPause),
+  mediaNext: (): Promise<void> => ipcRenderer.invoke(IPC.mediaNext),
+  mediaPrev: (): Promise<void> => ipcRenderer.invoke(IPC.mediaPrev),
   onState: (fn: (state: IslandState) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, state: IslandState): void => fn(state)
     ipcRenderer.on(IPC.stateChanged, listener)
